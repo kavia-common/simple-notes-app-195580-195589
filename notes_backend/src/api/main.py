@@ -2,8 +2,9 @@ import logging
 import os
 from typing import Any, Dict, List
 
-from fastapi import Depends, FastAPI, HTTPException, Response, status
+from fastapi import Depends, FastAPI, HTTPException, Request, Response, status
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 
@@ -31,6 +32,11 @@ def _parse_allowed_origins() -> List[str]:
     Parse comma-separated ALLOWED_ORIGINS from env.
 
     Falls back to localhost dev origins when not set.
+
+    Note:
+    - In Kavia preview environments, the frontend origin is typically a
+      `https://vscode-internal-<id>-...:3000` URL, not `http://localhost:3000`.
+      That origin must be allowed for browser requests to succeed.
     """
     raw = (os.getenv("ALLOWED_ORIGINS") or "").strip()
     if not raw:
@@ -40,14 +46,50 @@ def _parse_allowed_origins() -> List[str]:
     return [o for o in origins if o]
 
 
+def _parse_allowed_origin_regex() -> str | None:
+    """
+    Return a regex that matches allowed origins for local development and preview environments.
+
+    Env:
+      ALLOWED_ORIGIN_REGEX: optional regex override.
+
+    Default behavior:
+      - Allow the Kavia preview domain pattern used by the running frontend:
+        https://vscode-internal-<something>:3000
+    """
+    raw = (os.getenv("ALLOWED_ORIGIN_REGEX") or "").strip()
+    if raw:
+        return raw
+
+    # Allow Kavia preview URLs running the React dev server on port 3000.
+    # Example: https://vscode-internal-37437-qa.qa01.cloud.kavia.ai:3000
+    return r"^https?://vscode-internal-[^:]+:3000$"
+
+
 # React dev/preview runs on port 3000
 app.add_middleware(
     CORSMiddleware,
     allow_origins=_parse_allowed_origins(),
+    allow_origin_regex=_parse_allowed_origin_regex(),
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+@app.exception_handler(Exception)
+async def _unhandled_exception_handler(request: Request, exc: Exception) -> JSONResponse:
+    """
+    Return JSON for unexpected errors.
+
+    This prevents the frontend from seeing non-JSON bodies and helps surface real issues
+    (DB errors, coding errors) instead of opaque 'failed to fetch' symptoms.
+    """
+    logger.exception("Unhandled exception on %s %s", request.method, request.url.path)
+    return JSONResponse(
+        status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+        content={"detail": "Internal Server Error"},
+    )
 
 
 @app.on_event("startup")
@@ -117,11 +159,17 @@ def list_notes(db: Session = Depends(get_db)) -> List[NoteOut]:
 )
 def create_note(payload: NoteCreate, db: Session = Depends(get_db)) -> NoteOut:
     """Create a note."""
-    note = Note(title=payload.title.strip(), content=payload.content)
-    db.add(note)
-    db.commit()
-    db.refresh(note)
-    return note
+    logger.info("Creating note title_len=%s content_len=%s", len(payload.title), len(payload.content))
+    try:
+        note = Note(title=payload.title.strip(), content=payload.content)
+        db.add(note)
+        db.commit()
+        db.refresh(note)
+        return note
+    except Exception as exc:
+        # Ensure error is logged; exception handler will convert unhandled exceptions to JSON.
+        logger.exception("Failed creating note due to server error: %s", str(exc))
+        raise
 
 
 # PUBLIC_INTERFACE
