@@ -1,7 +1,8 @@
-from typing import List
+from typing import Any, Dict, List
 
 from fastapi import Depends, FastAPI, HTTPException, Response, status
 from fastapi.middleware.cors import CORSMiddleware
+from sqlalchemy import text
 from sqlalchemy.orm import Session
 
 from src.db import Base, engine, get_db
@@ -42,9 +43,30 @@ def _startup_create_tables() -> None:
 
 # PUBLIC_INTERFACE
 @app.get("/", tags=["Health"], summary="Health check", description="Returns a simple health payload.")
-def health_check():
+def health_check() -> Dict[str, str]:
     """Health check endpoint used by previews/monitoring."""
     return {"message": "Healthy"}
+
+
+# PUBLIC_INTERFACE
+@app.get(
+    "/health/db",
+    tags=["Health"],
+    summary="Database health check",
+    description=(
+        "Verifies PostgreSQL connectivity by running a lightweight read-only query (SELECT 1). "
+        "Returns status=up when the query succeeds, otherwise status=down with error details."
+    ),
+)
+def health_check_db(db: Session = Depends(get_db)) -> Dict[str, Any]:
+    """Database readiness endpoint used to verify DB connectivity."""
+    try:
+        # Use an explicit, short query to validate both connectivity and ability to execute statements.
+        value = db.execute(text("SELECT 1")).scalar_one()
+        return {"status": "up", "query": "SELECT 1", "result": int(value)}
+    except Exception as exc:
+        # Keep details for debugging; do not raise to avoid hiding error metadata behind generic FastAPI errors.
+        return {"status": "down", "error": str(exc)}
 
 
 # PUBLIC_INTERFACE
