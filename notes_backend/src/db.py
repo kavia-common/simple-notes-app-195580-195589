@@ -2,6 +2,7 @@ import os
 from pathlib import Path
 
 from sqlalchemy import create_engine
+from sqlalchemy.engine import make_url
 from sqlalchemy.orm import declarative_base, sessionmaker
 
 
@@ -30,8 +31,6 @@ def _read_db_connection_txt() -> str | None:
     """
     # This backend container lives at: <workspace>/notes_backend/src/db.py
     # The database container is a sibling workspace: simple-notes-app-.../database/db_connection.txt
-    # We try a relative walk-up to the common code-generation root, then locate any matching path.
-    # If this path structure changes, env vars (POSTGRES_URL etc.) should be used instead.
     here = Path(__file__).resolve()
     workspace_root = here.parents[3]  # .../simple-notes-app-195580-195589
     codegen_root = workspace_root.parent  # .../code-generation
@@ -55,26 +54,60 @@ def _read_db_connection_txt() -> str | None:
     return raw
 
 
+def _env_postgres_url_if_usable() -> str | None:
+    """
+    Return a SQLAlchemy-ready URL from POSTGRES_URL, but only if it is usable.
+
+    In this environment the orchestrator may inject a credential-less POSTGRES_URL such as:
+      postgresql://localhost:5000/myapp
+
+    psycopg2 will then default the username to the OS user (e.g. 'kavia'), causing:
+      FATAL: role "kavia" does not exist
+
+    To avoid startup failure, we only accept POSTGRES_URL when it includes credentials (user+password)
+    OR when an explicit username is provided (password may still be handled by other means, but for
+    this project we require both for reliability).
+    """
+    postgres_url = os.getenv("POSTGRES_URL")
+    if not postgres_url:
+        return None
+
+    # Accept either "postgresql://..." or "postgresql+psycopg2://..."
+    if postgres_url.startswith(("postgresql://", "postgresql+psycopg2://")):
+        normalized = _normalize_sqlalchemy_postgres_url(postgres_url)
+        try:
+            parsed = make_url(normalized)
+        except Exception:
+            # If URL is malformed, let SQLAlchemy raise later by returning it as-is.
+            return normalized
+
+        # Require explicit credentials to avoid falling back to OS user.
+        if parsed.username and parsed.password:
+            return normalized
+
+        # Credential-less URL is not usable in this project's setup.
+        return None
+
+    # If something else is provided, return as-is; SQLAlchemy will validate.
+    return postgres_url
+
+
 def _build_database_url() -> str:
     """
     Build a SQLAlchemy database URL.
 
     Preference order:
-    1) POSTGRES_URL (SQLAlchemy-compatible or postgresql:// URL)
+    1) POSTGRES_URL (only if it includes explicit credentials; see _env_postgres_url_if_usable)
     2) POSTGRES_USER/POSTGRES_PASSWORD/POSTGRES_DB/POSTGRES_PORT (compose a URL)
     3) Read ../database/db_connection.txt from the database container workspace (if present)
-    4) Final fallback: localhost:5001 (matches the running Postgres container port in this environment)
+    4) Final fallback: localhost:5001
 
     Notes:
     - Do not read .env directly; runtime env is injected by the orchestrator.
     """
-    postgres_url = os.getenv("POSTGRES_URL")
-    if postgres_url:
-        # Accept either "postgresql://..." or "postgresql+psycopg2://..."
-        if postgres_url.startswith("postgresql://") or postgres_url.startswith("postgresql+psycopg2://"):
-            return _normalize_sqlalchemy_postgres_url(postgres_url)
-        # If something else is provided, return as-is; SQLAlchemy will validate.
-        return postgres_url
+    usable_env_url = _env_postgres_url_if_usable()
+    if usable_env_url:
+        return usable_env_url
 
     user = os.getenv("POSTGRES_USER")
     password = os.getenv("POSTGRES_PASSWORD")
@@ -88,8 +121,7 @@ def _build_database_url() -> str:
     if db_txt_url:
         return db_txt_url
 
-    # Default to the running Postgres container port for this environment.
-    # (Database container is exposed on TCP port 5001 per work item context.)
+    # Final fallback (should be overridden by env in real deployments).
     return "postgresql+psycopg2://appuser:dbuser123@localhost:5001/myapp"
 
 

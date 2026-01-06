@@ -1,3 +1,5 @@
+import logging
+import os
 from typing import Any, Dict, List
 
 from fastapi import Depends, FastAPI, HTTPException, Response, status
@@ -8,6 +10,8 @@ from sqlalchemy.orm import Session
 from src.db import Base, engine, get_db
 from src.models import Note
 from src.schemas import NoteCreate, NoteOut, NoteUpdate
+
+logger = logging.getLogger(__name__)
 
 openapi_tags = [
     {"name": "Health", "description": "Service health and readiness endpoints."},
@@ -21,10 +25,25 @@ app = FastAPI(
     openapi_tags=openapi_tags,
 )
 
+
+def _parse_allowed_origins() -> List[str]:
+    """
+    Parse comma-separated ALLOWED_ORIGINS from env.
+
+    Falls back to localhost dev origins when not set.
+    """
+    raw = (os.getenv("ALLOWED_ORIGINS") or "").strip()
+    if not raw:
+        return ["http://localhost:3000", "http://127.0.0.1:3000"]
+
+    origins = [o.strip() for o in raw.split(",")]
+    return [o for o in origins if o]
+
+
 # React dev/preview runs on port 3000
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:3000", "http://127.0.0.1:3000"],
+    allow_origins=_parse_allowed_origins(),
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -36,9 +55,13 @@ def _startup_create_tables() -> None:
     """
     Create database tables if they do not exist.
 
-    This keeps the project simple (no explicit migration tooling) and is safe for this app's scope.
+    Important: do NOT fail application startup if the DB is unavailable/misconfigured.
+    The service should still bind to its port and expose /health/db to report readiness.
     """
-    Base.metadata.create_all(bind=engine)
+    try:
+        Base.metadata.create_all(bind=engine)
+    except Exception:
+        logger.exception("Database initialization failed during startup (tables not created).")
 
 
 # PUBLIC_INTERFACE
